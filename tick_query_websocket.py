@@ -213,6 +213,7 @@ def _on_message(ws, message):
                             if tick_size >= TICK_VOLUME_THRESHOLD:
                                 entry = {
                                     "symbol": symbol,
+                                    "price": float(state["price"]) if state["price"] else 0.0,
                                     "volume": int(tick_size),
                                     "cumulative_volume": int(vol),
                                     "time": datetime.now().strftime("%H:%M:%S.%f")[:-3],
@@ -284,6 +285,7 @@ def api_feed():
         for sym, st in _last_state.items():
             if st.get("minute") == datetime.now().minute and (st["buy_vol_1m"] > 0 or st["sell_vol_1m"] > 0):
                 stats[sym] = {
+                    "price": float(st["price"]) if st["price"] else 0.0,
                     "buy": int(st["buy_vol_1m"]),
                     "sell": int(st["sell_vol_1m"]),
                     "delta": int(st["buy_vol_1m"] - st["sell_vol_1m"])
@@ -369,16 +371,16 @@ DASHBOARD_HTML = """
   <div class="feed-wrap">
     <h2>Live Tick Feed</h2>
     <table>
-      <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th style="text-align:right">Tick Size</th></tr></thead>
-      <tbody id="feedBody"><tr><td colspan="4" class="empty">Watching the tape…</td></tr></tbody>
+      <thead><tr><th>Time</th><th>Symbol</th><th style="text-align:right">Price</th><th>Side</th><th style="text-align:right">Tick Size</th></tr></thead>
+      <tbody id="feedBody"><tr><td colspan="5" class="empty">Watching the tape…</td></tr></tbody>
     </table>
   </div>
   
   <div class="hot-wrap">
     <h2>Continuously Detected (Current 1m Candle)</h2>
     <table>
-      <thead><tr><th>Symbol</th><th style="text-align:right">Prints</th><th style="text-align:right">Buy Vol</th><th style="text-align:right">Sell Vol</th><th style="text-align:right">Delta</th></tr></thead>
-      <tbody id="hotBody"><tr><td colspan="5" class="empty">None yet</td></tr></tbody>
+      <thead><tr><th>Symbol</th><th style="text-align:right">Price</th><th style="text-align:right">Prints</th><th style="text-align:right">Buy Vol</th><th style="text-align:right">Sell Vol</th><th style="text-align:right">Delta</th></tr></thead>
+      <tbody id="hotBody"><tr><td colspan="6" class="empty">None yet</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -459,8 +461,8 @@ async function poll() {
     const hotBody = document.getElementById('hotBody');
     
     if (!data.feed.length) {
-      body.innerHTML = '<tr><td colspan="4" class="empty">Watching the tape…</td></tr>';
-      hotBody.innerHTML = '<tr><td colspan="5" class="empty">None yet</td></tr>';
+      body.innerHTML = '<tr><td colspan="5" class="empty">Watching the tape…</td></tr>';
+      hotBody.innerHTML = '<tr><td colspan="6" class="empty">None yet</td></tr>';
     } else {
       let counts = {};
       body.innerHTML = data.feed.map(r => {
@@ -471,6 +473,7 @@ async function poll() {
         return `<tr class="${isNew ? 'new-row' : ''}">
           <td class="time">${r.time}</td>
           <td class="clickable-sym" onclick="openChart('${r.symbol}')">${r.symbol}</td>
+          <td class="vol">${r.price ? r.price.toFixed(2) : "0.00"}</td>
           <td class="${r.side === 'BUY' ? 'live' : (r.side === 'SELL' ? 'dead' : '')}" style="font-size:12px;font-weight:bold;">${r.side || ''}</td>
           <td class="vol">${fmtVol(r.volume)}</td>
         </tr>`;
@@ -478,16 +481,17 @@ async function poll() {
       
       let hotArr = Object.entries(counts).filter(e => e[1] > 1).sort((a,b) => b[1] - a[1]);
       if (hotArr.length === 0) {
-        hotBody.innerHTML = '<tr><td colspan="5" class="empty">None yet</td></tr>';
+        hotBody.innerHTML = '<tr><td colspan="6" class="empty">None yet</td></tr>';
       } else {
         hotBody.innerHTML = hotArr.map(e => {
           let sym = e[0];
           let c = e[1];
-          let stat = data.stats[sym] || {buy:0, sell:0, delta:0};
+          let stat = data.stats[sym] || {buy:0, sell:0, delta:0, price:0};
           let deltaColor = stat.delta > 0 ? 'var(--live)' : (stat.delta < 0 ? 'var(--dead)' : 'var(--text)');
           return `
           <tr>
             <td class="hot-symbol clickable-sym" onclick="openChart('${sym}')">${sym}</td>
+            <td class="vol">${stat.price ? stat.price.toFixed(2) : "0.00"}</td>
             <td class="vol">${c}</td>
             <td class="vol" style="color:var(--live)">${fmtVol(stat.buy)}</td>
             <td class="vol" style="color:var(--dead)">${fmtVol(stat.sell)}</td>
@@ -499,7 +503,10 @@ async function poll() {
       
       // Update active modal if open
       if (activeModalSymbol) {
-        let stat = data.stats[activeModalSymbol] || {buy:0, sell:0, delta:0};
+        let stat = data.stats[activeModalSymbol] || {buy:0, sell:0, delta:0, price:0};
+        
+        document.getElementById('modalTitle').innerText = activeModalSymbol + " @ ₹" + (stat.price ? stat.price.toFixed(2) : "0.00");
+        
         document.getElementById('modalBuy').innerText = fmtVol(stat.buy);
         document.getElementById('modalSell').innerText = fmtVol(stat.sell);
         
