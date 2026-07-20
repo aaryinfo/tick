@@ -46,6 +46,7 @@ Run:
 
 from __future__ import annotations
 
+import os
 import json
 import random
 import re
@@ -522,4 +523,5 @@ setInterval(poll, 1000);   // just re-reads the in-memory feed — ticks arrive 
 """
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5003, debug=False, use_reloader=False)
+    port = int(os.environ.get("PORT", 5003))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
