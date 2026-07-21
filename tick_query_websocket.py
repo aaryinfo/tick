@@ -351,13 +351,13 @@ DASHBOARD_HTML = """
   .dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:6px; }
   .status { margin-left:auto; font-size:12px; color:var(--muted); display:flex; align-items:center; }
   
-  .container { display:flex; gap:20px; max-width:1800px; margin:16px auto; align-items:flex-start; padding:0 16px; }
+  .container { display:flex; gap:12px; max-width:1800px; margin:16px auto; align-items:flex-start; padding:0 12px; }
   .feed-wrap { flex:1; background:var(--panel); border:1px solid var(--border); border-radius:10px; overflow-x:auto; }
-  .hot-wrap { flex:1.5; background:var(--panel); border:1px solid var(--border); border-radius:10px; overflow-x:auto; }
+  .hot-wrap { flex:1.8; background:var(--panel); border:1px solid var(--border); border-radius:10px; overflow-x:auto; }
   
   h2 { font-size:14px; margin:0; padding:12px 16px; border-bottom:1px solid var(--border); background:rgba(255,255,255,0.03); }
-  table { width:100%; border-collapse:collapse; font-size:14px; }
-  th, td { padding:10px 16px; text-align:left; border-bottom:1px solid var(--border); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { padding:8px 10px; text-align:left; border-bottom:1px solid var(--border); }
   th { color:var(--muted); font-weight:500; font-size:11px; text-transform:uppercase; }
   td.vol { text-align:right; font-variant-numeric:tabular-nums; }
   td.time { color:var(--muted); font-size:12px; white-space:nowrap; }
