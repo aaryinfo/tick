@@ -351,9 +351,9 @@ DASHBOARD_HTML = """
   .dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:6px; }
   .status { margin-left:auto; font-size:12px; color:var(--muted); display:flex; align-items:center; }
   
-  .container { display:flex; gap:20px; max-width:1200px; margin:16px auto; align-items:flex-start; padding:0 16px; }
-  .feed-wrap { flex:1; background:var(--panel); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
-  .hot-wrap { width:460px; background:var(--panel); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+  .container { display:flex; gap:20px; max-width:1800px; margin:16px auto; align-items:flex-start; padding:0 16px; }
+  .feed-wrap { flex:1; background:var(--panel); border:1px solid var(--border); border-radius:10px; overflow-x:auto; }
+  .hot-wrap { flex:1.5; background:var(--panel); border:1px solid var(--border); border-radius:10px; overflow-x:auto; }
   
   h2 { font-size:14px; margin:0; padding:12px 16px; border-bottom:1px solid var(--border); background:rgba(255,255,255,0.03); }
   table { width:100%; border-collapse:collapse; font-size:14px; }
