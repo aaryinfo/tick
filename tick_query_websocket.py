@@ -56,6 +56,8 @@ import time
 from datetime import datetime, timezone, timedelta
 IST = timezone(timedelta(hours=5, minutes=30))
 from collections import deque
+import yfinance as yf
+import pandas as pd
 
 import websocket
 from flask import Flask, jsonify, render_template_string
@@ -113,6 +115,23 @@ _lock = threading.Lock()
 _feed = deque(maxlen=FEED_MAX_ROWS)
 _last_volume = {}          # symbol -> last known cumulative day volume
 _last_push_ts = None
+
+_historical_volume = {}
+
+def _fetch_historical_volume():
+    try:
+        tickers = [s + ".NS" for s in NIFTY500_STOCKS]
+        data = yf.download(tickers, period="5d", progress=False)
+        if "Volume" in data:
+            vol_data = data["Volume"].sum()
+            with _lock:
+                for symbol, vol in vol_data.items():
+                    clean_sym = symbol.replace(".NS", "")
+                    _historical_volume[clean_sym] = int(vol)
+    except Exception as e:
+        print("Failed to fetch historical volume:", e)
+
+threading.Thread(target=_fetch_historical_volume, daemon=True).start()
 _connected = False
 
 
@@ -298,7 +317,9 @@ def api_feed():
                     "chp": float(st.get("chp", 0.0)),
                     "buy": int(st["buy_vol_1m"]),
                     "sell": int(st["sell_vol_1m"]),
-                    "delta": int(st["buy_vol_1m"] - st["sell_vol_1m"])
+                    "delta": int(st["buy_vol_1m"] - st["sell_vol_1m"]),
+                    "vol_5d": _historical_volume.get(sym, 0),
+                    "vol_today": int(st.get("vol") or 0)
                 }
     return jsonify({
         "ok": True,
@@ -389,8 +410,8 @@ DASHBOARD_HTML = """
   <div class="hot-wrap">
     <h2>Continuously Detected (Current 1m Candle)</h2>
     <table>
-      <thead><tr><th>Symbol</th><th style="text-align:right">Price</th><th style="text-align:right">% Chg</th><th style="text-align:right">Prints</th><th style="text-align:right">Buy Vol</th><th style="text-align:right">Sell Vol</th><th style="text-align:right">Delta</th></tr></thead>
-      <tbody id="hotBody"><tr><td colspan="7" class="empty">None yet</td></tr></tbody>
+      <thead><tr><th>Symbol</th><th style="text-align:right">Price</th><th style="text-align:right">% Chg</th><th style="text-align:right">Prints</th><th style="text-align:right">Buy Vol</th><th style="text-align:right">Sell Vol</th><th style="text-align:right">Delta</th><th style="text-align:right">5D Vol</th><th style="text-align:right">Curr Vol</th><th style="text-align:right">Vol Delta</th></tr></thead>
+      <tbody id="hotBody"><tr><td colspan="10" class="empty">None yet</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -492,13 +513,17 @@ async function poll() {
       
       let hotArr = Object.entries(counts).filter(e => e[1] > 1).sort((a,b) => b[1] - a[1]);
       if (hotArr.length === 0) {
-        hotBody.innerHTML = '<tr><td colspan="6" class="empty">None yet</td></tr>';
+        hotBody.innerHTML = '<tr><td colspan="10" class="empty">None yet</td></tr>';
       } else {
         hotBody.innerHTML = hotArr.map(e => {
           let sym = e[0];
           let c = e[1];
           let stat = data.stats[sym] || {buy:0, sell:0, delta:0, price:0};
+          let vol_5d = stat.vol_5d || 0;
+          let vol_today = stat.vol_today || 0;
+          let vol_delta = vol_today - vol_5d;
           let deltaColor = stat.delta > 0 ? 'var(--live)' : (stat.delta < 0 ? 'var(--dead)' : 'var(--text)');
+          let volDeltaColor = vol_delta > 0 ? 'var(--live)' : (vol_delta < 0 ? 'var(--dead)' : 'var(--text)');
           return `
           <tr>
             <td class="hot-symbol clickable-sym" onclick="openChart('${sym}')">${sym}</td>
@@ -508,6 +533,9 @@ async function poll() {
             <td class="vol" style="color:var(--live)">${fmtVol(stat.buy)}</td>
             <td class="vol" style="color:var(--dead)">${fmtVol(stat.sell)}</td>
             <td class="vol" style="color:${deltaColor};font-weight:bold">${fmtVol(stat.delta)}</td>
+            <td class="vol">${fmtVol(vol_5d)}</td>
+            <td class="vol">${fmtVol(vol_today)}</td>
+            <td class="vol" style="color:${volDeltaColor};font-weight:bold">${fmtVol(vol_delta)}</td>
           </tr>
           `;
         }).join('');

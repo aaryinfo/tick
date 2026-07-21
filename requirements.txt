@@ -1,2 +1,4 @@
 Flask==3.0.0
 websocket-client==1.6.1
+yfinance
+pandas
