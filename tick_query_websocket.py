@@ -174,7 +174,7 @@ def _on_message(ws, message):
             curr_min = datetime.now(IST).minute
             
             if state is None:
-                state = {"price": None, "vol": None, "dir": 1, "buy_vol": 0, "sell_vol": 0, "buy_vol_1m": 0, "sell_vol_1m": 0, "minute": curr_min}
+                state = {"price": None, "vol": None, "dir": 1, "buy_vol": 0, "sell_vol": 0, "buy_vol_1m": 0, "sell_vol_1m": 0, "minute": curr_min, "chp": 0.0}
                 _last_state[symbol] = state
             
             if state["minute"] != curr_min:
@@ -197,6 +197,13 @@ def _on_message(ws, message):
                 except ValueError:
                     pass
 
+            chp = values.get("chp")
+            if chp is not None:
+                try:
+                    state["chp"] = float(chp)
+                except ValueError:
+                    pass
+
             vol = values.get("volume")
             if vol is not None:
                 try:
@@ -215,6 +222,7 @@ def _on_message(ws, message):
                                 entry = {
                                     "symbol": symbol,
                                     "price": float(state["price"]) if state["price"] else 0.0,
+                                    "chp": state.get("chp", 0.0),
                                     "volume": int(tick_size),
                                     "cumulative_volume": int(vol),
                                     "time": datetime.now(IST).strftime("%H:%M:%S.%f")[:-3],
@@ -287,6 +295,7 @@ def api_feed():
             if st.get("minute") == datetime.now(IST).minute and (st["buy_vol_1m"] > 0 or st["sell_vol_1m"] > 0):
                 stats[sym] = {
                     "price": float(st["price"]) if st["price"] else 0.0,
+                    "chp": float(st.get("chp", 0.0)),
                     "buy": int(st["buy_vol_1m"]),
                     "sell": int(st["sell_vol_1m"]),
                     "delta": int(st["buy_vol_1m"] - st["sell_vol_1m"])
@@ -372,16 +381,16 @@ DASHBOARD_HTML = """
   <div class="feed-wrap">
     <h2>Live Tick Feed</h2>
     <table>
-      <thead><tr><th>Time</th><th>Symbol</th><th style="text-align:right">Price</th><th>Side</th><th style="text-align:right">Tick Size</th></tr></thead>
-      <tbody id="feedBody"><tr><td colspan="5" class="empty">Watching the tape…</td></tr></tbody>
+      <thead><tr><th>Time</th><th>Symbol</th><th style="text-align:right">Price</th><th style="text-align:right">% Chg</th><th>Side</th><th style="text-align:right">Tick Size</th></tr></thead>
+      <tbody id="feedBody"><tr><td colspan="6" class="empty">Watching the tape…</td></tr></tbody>
     </table>
   </div>
   
   <div class="hot-wrap">
     <h2>Continuously Detected (Current 1m Candle)</h2>
     <table>
-      <thead><tr><th>Symbol</th><th style="text-align:right">Price</th><th style="text-align:right">Prints</th><th style="text-align:right">Buy Vol</th><th style="text-align:right">Sell Vol</th><th style="text-align:right">Delta</th></tr></thead>
-      <tbody id="hotBody"><tr><td colspan="6" class="empty">None yet</td></tr></tbody>
+      <thead><tr><th>Symbol</th><th style="text-align:right">Price</th><th style="text-align:right">% Chg</th><th style="text-align:right">Prints</th><th style="text-align:right">Buy Vol</th><th style="text-align:right">Sell Vol</th><th style="text-align:right">Delta</th></tr></thead>
+      <tbody id="hotBody"><tr><td colspan="7" class="empty">None yet</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -475,6 +484,7 @@ async function poll() {
           <td class="time">${r.time}</td>
           <td class="clickable-sym" onclick="openChart('${r.symbol}')">${r.symbol}</td>
           <td class="vol">${r.price ? r.price.toFixed(2) : "0.00"}</td>
+          <td class="vol" style="color:${r.chp >= 0 ? 'var(--live)' : 'var(--dead)'}">${r.chp ? (r.chp > 0 ? '+' : '') + r.chp.toFixed(2) + '%' : '0.00%'}</td>
           <td class="${r.side === 'BUY' ? 'live' : (r.side === 'SELL' ? 'dead' : '')}" style="font-size:12px;font-weight:bold;">${r.side || ''}</td>
           <td class="vol">${fmtVol(r.volume)}</td>
         </tr>`;
@@ -493,6 +503,7 @@ async function poll() {
           <tr>
             <td class="hot-symbol clickable-sym" onclick="openChart('${sym}')">${sym}</td>
             <td class="vol">${stat.price ? stat.price.toFixed(2) : "0.00"}</td>
+            <td class="vol" style="color:${(stat.chp || 0) >= 0 ? 'var(--live)' : 'var(--dead)'}">${stat.chp ? (stat.chp > 0 ? '+' : '') + stat.chp.toFixed(2) + '%' : '0.00%'}</td>
             <td class="vol">${c}</td>
             <td class="vol" style="color:var(--live)">${fmtVol(stat.buy)}</td>
             <td class="vol" style="color:var(--dead)">${fmtVol(stat.sell)}</td>
