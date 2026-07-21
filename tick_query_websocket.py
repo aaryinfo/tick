@@ -53,7 +53,8 @@ import re
 import string
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+IST = timezone(timedelta(hours=5, minutes=30))
 from collections import deque
 
 import websocket
@@ -170,7 +171,7 @@ def _on_message(ws, message):
         symbol = sym_full.split(":")[-1]
         with _lock:
             state = _last_state.get(symbol)
-            curr_min = datetime.now().minute
+            curr_min = datetime.now(IST).minute
             
             if state is None:
                 state = {"price": None, "vol": None, "dir": 1, "buy_vol": 0, "sell_vol": 0, "buy_vol_1m": 0, "sell_vol_1m": 0, "minute": curr_min}
@@ -216,7 +217,7 @@ def _on_message(ws, message):
                                     "price": float(state["price"]) if state["price"] else 0.0,
                                     "volume": int(tick_size),
                                     "cumulative_volume": int(vol),
-                                    "time": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                                    "time": datetime.now(IST).strftime("%H:%M:%S.%f")[:-3],
                                     "side": "BUY" if state["dir"] == 1 else "SELL"
                                 }
                                 _feed.appendleft(entry)
@@ -283,7 +284,7 @@ def api_feed():
         live = _connected
         stats = {}
         for sym, st in _last_state.items():
-            if st.get("minute") == datetime.now().minute and (st["buy_vol_1m"] > 0 or st["sell_vol_1m"] > 0):
+            if st.get("minute") == datetime.now(IST).minute and (st["buy_vol_1m"] > 0 or st["sell_vol_1m"] > 0):
                 stats[sym] = {
                     "price": float(st["price"]) if st["price"] else 0.0,
                     "buy": int(st["buy_vol_1m"]),
@@ -293,7 +294,7 @@ def api_feed():
     return jsonify({
         "ok": True,
         "connected": live,
-        "timestamp": datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "",
+        "timestamp": datetime.fromtimestamp(ts, IST).strftime("%H:%M:%S") if ts else "",
         "feed": feed_snapshot,
         "stats": stats
     })
