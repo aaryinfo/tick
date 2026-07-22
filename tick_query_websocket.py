@@ -1,68 +1,12 @@
 """
-Tick Query Feed (WebSocket) — Nifty 500, real tick-by-tick
---------------------------------------------------------------
-Same minimal Iris-style feed (Symbol + Volume) as tick_query_feed.py,
-but this version is event-driven off TradingView's own live WebSocket
-protocol instead of polling the scanner every 5s — so a "big print"
-shows up the instant TradingView's backend sees it, not up to 5
-seconds later.
-
-HOW IT WORKS
-- Opens one WebSocket to TradingView's internal quote feed (the same
-  channel their own charting UI uses to update prices/volume live).
-- Subscribes to every symbol in NIFTY500_STOCKS on an NSE quote session.
-- Each incoming "qsd" push carries a symbol's *cumulative day volume*.
-  The size of the print that just happened is:
-        tick_volume = current_cumulative_volume - previous_cumulative_volume
-  That delta — not the raw cumulative number — is what gets compared
-  against TICK_VOLUME_THRESHOLD to decide "unusual single print".
-- Anything over the threshold is pushed straight into the feed, no
-  polling interval involved at all.
-
-HONEST CAVEATS (please read before relying on this):
-1. This is TradingView's undocumented internal protocol, not a public
-   API — it's reverse-engineered (multiple open-source projects use
-   the same approach), not something TradingView publishes or
-   supports. It can change or start blocking without notice.
-2. NSE data is real-time by default for non-professional TradingView
-   accounts (per TradingView's own docs) — but this connects
-   anonymously (no login), and anonymous sessions have occasionally
-   been delayed/rate-limited in practice. If you see the feed lagging
-   real trades, log in with a real TradingView auth token (see
-   AUTH_TOKEN below) rather than assuming it's broken.
-3. Subscribing to 200-500 symbols on one anonymous connection may get
-   throttled. If you see gaps or disconnects, split NIFTY500_STOCKS
-   across a few connections/sessions rather than one giant one.
-4. This is still "biggest single print" detection, not full order-flow
-   / bid-ask aggressor classification like real Iris tick reads.
-
-NEW: HAMMER / HANGING MAN CANDLE ALERTS (5m AND 15m)
-- 5-minute AND 15-minute OHLC candles are built on the fly from the same
-  "lp" (last price) ticks already arriving for every symbol — no extra
-  subscription needed.
-- When a candle closes, its shape is tested: small body, long lower
-  wick (>= 2x body), little/no upper wick. This shape is IDENTICAL for
-  both patterns — only where it forms differs:
-      * forms at a new HAMMER_LOOKBACK-candle swing LOW  -> "HAMMER"       (bottom, bullish)
-      * forms at a new HAMMER_LOOKBACK-candle swing HIGH -> "HANGING MAN"  (top, bearish)
-- VOLUME CONFIRMATION: an alert only fires if that same candle also saw at
-  least one unusual print (>= TICK_VOLUME_THRESHOLD) — i.e. the stock would
-  also be showing up in "Continuously Detected". Shape without volume behind
-  it is skipped.
-- Tune the shape via HAMMER_BODY_RATIO_MAX / HAMMER_LOWER_SHADOW_MULT /
-  HAMMER_UPPER_SHADOW_MAX_RATIO, and the swing-context window via
-  HAMMER_LOOKBACK, near the top of this file.
-- Each timeframe gets its own scrollable, fixed-height panel on the
-  dashboard showing only the latest PATTERN_ALERTS_DISPLAY_LIMIT (5)
-  alerts, and in GET /api/feed under the "patterns_5m" and
-  "patterns_15m" keys.
-
-Install:
-    pip install websocket-client flask --break-system-packages
-
-Run:
-    python tick_query_websocket.py
-    -> open http://localhost:5003
+Tick Query Feed (WebSocket) — Nifty 500, real tick-by-tick with 15m Top/Bottom & Divergence Signals
+-------------------------------------------------------------------------------------------------
+- Live WebSocket connection to TradingView's NSE quote feed.
+- Evaluates 15-minute and 5-minute candles for:
+  1. Top & Bottom pivots (15m Top / 15m Bottom)
+  2. Bullish & Bearish RSI Divergence
+  3. Volume Divergence with timing timestamps
+- Displays explicit BUY and SELL signals for every symbol across 15m and 5m timeframes.
 """
 
 from __future__ import annotations
@@ -86,7 +30,7 @@ from flask import Flask, jsonify, render_template_string
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# Universe — starter Nifty 500 set (paste your full constituent list here)
+# Universe — starter Nifty 500 set
 # ---------------------------------------------------------------------------
 NIFTY500_STOCKS = [
     "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","HINDUNILVR","SBIN","BHARTIARTL",
@@ -121,33 +65,16 @@ NIFTY500_STOCKS = [
 NIFTY500_STOCKS = sorted(set(NIFTY500_STOCKS))
 SYMBOLS_TV = [f"NSE:{s}" for s in NIFTY500_STOCKS]
 
-# Anonymous token. If you have a TradingView login and see delayed/rate
-# limited data, replace with a real session auth token (extracted from
-# your logged-in browser's websocket traffic) instead.
 AUTH_TOKEN = "unauthorized_user_token"
 
-TICK_VOLUME_THRESHOLD = 20_000     # shares in a single print to count as "unusual" — tune per price band
-SYMBOLS_PER_SESSION = 50            # batch size per quote session (keeps subscribe messages small)
+TICK_VOLUME_THRESHOLD = 20_000     # shares in a single print to count as "unusual"
+SYMBOLS_PER_SESSION = 50
 FEED_MAX_ROWS = 150
 
 # ---------------------------------------------------------------------------
-# Hammer / Hanging Man candle-pattern alerts (5m AND 15m)
+# 15m & 5m Reversal Signals, RSI Divergence & Volume Divergence Configuration
 # ---------------------------------------------------------------------------
-# Candles are built tick-by-tick (open/high/low/close of "lp") over a
-# 5-minute bucket and a 15-minute bucket. Shape test is IDENTICAL for
-# Hammer and Hanging Man (small body, long lower wick, tiny/no upper wick) —
-# the only difference is context:
-#   - forms at a new swing LOW (bottom of a move)  -> "HAMMER"      (bullish)
-#   - forms at a new swing HIGH (top of a move)     -> "HANGING MAN" (bearish)
-#
-# VOLUME CONFIRMATION: an alert only fires if the candle also saw at least one
-# "unusual" print (>= TICK_VOLUME_THRESHOLD) during that candle — i.e. the same
-# stock would also show up in "Continuously Detected". Shape without a volume
-# spike behind it is skipped.
-HAMMER_LOOKBACK = 5                 # prior closed candles used to establish swing high/low context
-HAMMER_BODY_RATIO_MAX = 0.35        # body must be <= 35% of the candle's high-low range
-HAMMER_LOWER_SHADOW_MULT = 2.0      # lower wick must be >= 2x the body
-HAMMER_UPPER_SHADOW_MAX_RATIO = 0.15  # upper wick must be <= 15% of the range
+SIGNAL_LOOKBACK = 5                 # prior candles context for swing top/bottom & divergence
 PATTERN_FEED_MAX_ROWS = 100         # how much history each timeframe keeps server-side
 PATTERN_ALERTS_DISPLAY_LIMIT = 5    # how many latest alerts each panel actually shows
 
@@ -155,18 +82,140 @@ WS_URL = "wss://data.tradingview.com/socket.io/websocket"
 
 _lock = threading.Lock()
 _feed = deque(maxlen=FEED_MAX_ROWS)
-_last_volume = {}          # symbol -> last known cumulative day volume
+_last_volume = {}
 _last_push_ts = None
 
-_candle_history_5m = {}     # symbol -> deque[{open,high,low,close,time}] of CLOSED 5m candles
-_pattern_alerts_5m = deque(maxlen=PATTERN_FEED_MAX_ROWS)   # Hammer / Hanging Man alerts (5m), newest first
+_candle_history_5m = {}     # symbol -> deque[{open,high,low,close,volume,time}] of CLOSED 5m candles
+_pattern_alerts_5m = deque(maxlen=PATTERN_FEED_MAX_ROWS)   # 5m BUY/SELL alerts, newest first
 
-_candle_history_15m = {}    # symbol -> deque[{open,high,low,close,time}] of CLOSED 15m candles
-_pattern_alerts_15m = deque(maxlen=PATTERN_FEED_MAX_ROWS)  # Hammer / Hanging Man alerts (15m), newest first
+_candle_history_15m = {}    # symbol -> deque[{open,high,low,close,volume,time}] of CLOSED 15m candles
+_pattern_alerts_15m = deque(maxlen=PATTERN_FEED_MAX_ROWS)  # 15m BUY/SELL alerts, newest first
 
 _historical_volume = {}
 
-def _fetch_historical_volume():
+
+def _calc_rsi(closes: list[float], period: int = 14) -> float:
+    """Computes standard Relative Strength Index (RSI)."""
+    if len(closes) < 2:
+        return 50.0
+    gains = []
+    losses = []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        if diff > 0:
+            gains.append(diff)
+            losses.append(0.0)
+        else:
+            gains.append(0.0)
+            losses.append(abs(diff))
+
+    p = min(period, len(gains))
+    if p == 0:
+        return 50.0
+    avg_gain = sum(gains[-p:]) / p
+    avg_loss = sum(losses[-p:]) / p
+
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    rs = avg_gain / avg_loss
+    return round(100.0 - (100.0 / (1.0 + rs)), 1)
+
+
+def _check_reversal_divergence(symbol: str, candle: dict, history: deque, alerts: deque, timeframe: str):
+    """
+    Evaluates closed 15m (or 5m) candles for Top/Bottom pivot formations,
+    RSI Divergence, and Volume Divergence, generating BUY or SELL signals.
+    """
+    if len(history) < 2:
+        return
+
+    prior = list(history)[-SIGNAL_LOOKBACK:]
+    prior_closes = [p["close"] for p in prior]
+    prior_lows = [p["low"] for p in prior]
+    prior_highs = [p["high"] for p in prior]
+    prior_vols = [p.get("volume", 0) for p in prior]
+
+    o, h, l, c = candle["open"], candle["high"], candle["low"], candle["close"]
+    vol = candle.get("volume", 0)
+
+    # All closes including current for RSI calculation
+    all_closes = prior_closes + [c]
+    all_rsi = []
+    for i in range(1, len(all_closes) + 1):
+        all_rsi.append(_calc_rsi(all_closes[:i]))
+
+    curr_rsi = all_rsi[-1]
+
+    # Prior swing low & high indices
+    min_prior_low = min(prior_lows)
+    idx_min_low = prior_lows.index(min_prior_low)
+    rsi_at_min_low = all_rsi[idx_min_low]
+    vol_at_min_low = prior_vols[idx_min_low]
+
+    max_prior_high = max(prior_highs)
+    idx_max_high = prior_highs.index(max_prior_high)
+    rsi_at_max_high = all_rsi[idx_max_high]
+    vol_at_max_high = prior_vols[idx_max_high]
+
+    # Check 15m / 5m Bottom or Top made
+    is_bottom = (l <= min_prior_low) or (l <= min(prior_lows[-2:]) and c > o)
+    is_top = (h >= max_prior_high) or (h >= max(prior_highs[-2:]) and c < o)
+
+    # Bullish Divergence (BUY Signal)
+    rsi_bull_div = (l <= min_prior_low) and (curr_rsi > rsi_at_min_low + 0.5)
+    vol_bull_div = (l <= min_prior_low) and (vol < vol_at_min_low * 0.9 or (c > o and vol > vol_at_min_low))
+
+    # Bearish Divergence (SELL Signal)
+    rsi_bear_div = (h >= max_prior_high) and (curr_rsi < rsi_at_max_high - 0.5)
+    vol_bear_div = (h >= max_prior_high) and (vol < vol_at_max_high * 0.9 or (c < o and vol > vol_at_max_high))
+
+    signal = None
+    pivot_label = None
+    rsi_div_label = "Neutral"
+    vol_div_label = "Normal"
+
+    if is_bottom and (rsi_bull_div or vol_bull_div or curr_rsi <= 45 or c > o):
+        signal = "BUY"
+        pivot_label = f"{timeframe} Bottom"
+        rsi_div_label = f"Bullish ({curr_rsi})" if rsi_bull_div else f"RSI {curr_rsi}"
+        if vol_bull_div:
+            vol_div_label = "Vol Exhaustion" if vol < vol_at_min_low else "Volume Surge"
+        else:
+            vol_div_label = "Vol Confirm"
+    elif is_top and (rsi_bear_div or vol_bear_div or curr_rsi >= 55 or c < o):
+        signal = "SELL"
+        pivot_label = f"{timeframe} Top"
+        rsi_div_label = f"Bearish ({curr_rsi})" if rsi_bear_div else f"RSI {curr_rsi}"
+        if vol_bear_div:
+            vol_div_label = "Vol Exhaustion" if vol < vol_at_max_high else "Volume Surge"
+        else:
+            vol_div_label = "Vol Confirm"
+
+    if signal is None:
+        return
+
+    # Avoid duplicate consecutive alert for same symbol, signal, and time
+    if alerts and alerts[0]["symbol"] == symbol and alerts[0]["time"] == candle["time"] and alerts[0]["signal"] == signal:
+        return
+
+    alerts.appendleft({
+        "symbol": symbol,
+        "signal": signal,
+        "pivot": pivot_label,
+        "rsi_div": rsi_div_label,
+        "vol_div": vol_div_label,
+        "timeframe": timeframe,
+        "time": candle["time"],
+        "open": round(o, 2),
+        "high": round(h, 2),
+        "low": round(l, 2),
+        "close": round(c, 2),
+        "rsi": curr_rsi,
+        "volume": int(vol),
+    })
+
+
+def _fetch_historical_data():
     try:
         tickers = [s + ".NS" for s in NIFTY500_STOCKS]
         data = yf.download(tickers, period="5d", progress=False)
@@ -175,11 +224,44 @@ def _fetch_historical_volume():
             with _lock:
                 for symbol, vol in vol_data.items():
                     clean_sym = symbol.replace(".NS", "")
-                    _historical_volume[clean_sym] = int(vol)
-    except Exception as e:
-        print("Failed to fetch historical volume:", e)
+                    if not pd.isna(vol):
+                        _historical_volume[clean_sym] = int(vol)
 
-threading.Thread(target=_fetch_historical_volume, daemon=True).start()
+        # Seed 15m & 5m candle history for top stocks so signal panels populate right away
+        sample_tickers = tickers[:80]
+        data_15m = yf.download(sample_tickers, period="2d", interval="15m", progress=False)
+        if not data_15m.empty and "Close" in data_15m:
+            with _lock:
+                for sym_ns in sample_tickers:
+                    clean_sym = sym_ns.replace(".NS", "")
+                    try:
+                        df_s = pd.DataFrame({
+                            "open": data_15m["Open"][sym_ns],
+                            "high": data_15m["High"][sym_ns],
+                            "low": data_15m["Low"][sym_ns],
+                            "close": data_15m["Close"][sym_ns],
+                            "volume": data_15m["Volume"][sym_ns]
+                        }).dropna()
+
+                        hist_15m = deque(maxlen=SIGNAL_LOOKBACK + 1)
+                        for ts, r in df_s.iterrows():
+                            c_dict = {
+                                "open": float(r["open"]), "high": float(r["high"]),
+                                "low": float(r["low"]), "close": float(r["close"]),
+                                "volume": int(r["volume"]),
+                                "time": ts.strftime("%H:%M:%S")
+                            }
+                            if len(hist_15m) >= 2:
+                                _check_reversal_divergence(clean_sym, c_dict, hist_15m, _pattern_alerts_15m, "15m")
+                            hist_15m.append(c_dict)
+                        _candle_history_15m[clean_sym] = hist_15m
+                    except Exception:
+                        pass
+    except Exception as e:
+        print("Failed to fetch historical data:", e)
+
+
+threading.Thread(target=_fetch_historical_data, daemon=True).start()
 _connected = False
 
 
@@ -213,74 +295,7 @@ def _split_frames(raw: str):
     return frames
 
 
-_last_state = {} # symbol -> {"price": None, "vol": None, "dir": 1, "buy_vol": 0, "sell_vol": 0, "buy_vol_1m": 0, "sell_vol_1m": 0, "minute": -1}
-
-
-def _hammer_shape(o: float, h: float, l: float, c: float):
-    """
-    Shape test shared by Hammer and Hanging Man (they're the same candle —
-    only the trend context differs). Returns (is_match, body_pct, lower_pct, upper_pct)
-    where the pct values are relative to the candle's high-low range, for display.
-    """
-    rng = h - l
-    if rng <= 0:
-        return False, 0.0, 0.0, 0.0
-
-    body = abs(c - o)
-    upper_wick = h - max(o, c)
-    lower_wick = min(o, c) - l
-
-    is_match = (
-        lower_wick >= HAMMER_LOWER_SHADOW_MULT * max(body, rng * 0.02) and
-        upper_wick <= HAMMER_UPPER_SHADOW_MAX_RATIO * rng and
-        body <= HAMMER_BODY_RATIO_MAX * rng
-    )
-    return is_match, (body / rng) * 100, (lower_wick / rng) * 100, (upper_wick / rng) * 100
-
-
-def _check_candle_pattern(symbol: str, candle: dict, history: deque, alerts: deque,
-                           volume_confirmed: bool, timeframe: str):
-    """
-    Called once per symbol right as a candle (1m or 15m) closes. Checks the
-    just-closed candle's shape, requires it to be backed by an unusual print
-    during that same candle (volume_confirmed), then uses the preceding
-    HAMMER_LOOKBACK closed candles to decide whether it's forming at a swing
-    LOW (-> Hammer) or a swing HIGH (-> Hanging Man).
-    """
-    if not volume_confirmed:
-        return  # shape alone isn't enough — require an unusual print behind it
-
-    if len(history) < HAMMER_LOOKBACK:
-        return  # not enough prior candles yet to judge swing context
-
-    o, h, l, c = candle["open"], candle["high"], candle["low"], candle["close"]
-    is_match, body_pct, lower_pct, upper_pct = _hammer_shape(o, h, l, c)
-    if not is_match:
-        return
-
-    prior = list(history)[-HAMMER_LOOKBACK:]
-    prior_low = min(p["low"] for p in prior)
-    prior_high = max(p["high"] for p in prior)
-
-    pattern = None
-    if l <= prior_low:
-        pattern = "HAMMER"          # new swing low + shape -> bullish reversal candidate
-    elif h >= prior_high:
-        pattern = "HANGING MAN"     # new swing high + shape -> bearish reversal candidate
-
-    if pattern is None:
-        return
-
-    alerts.appendleft({
-        "symbol": symbol,
-        "pattern": pattern,
-        "timeframe": timeframe,
-        "time": candle["time"],
-        "open": round(o, 2), "high": round(h, 2), "low": round(l, 2), "close": round(c, 2),
-        "body_pct": round(body_pct, 1),
-        "lower_wick_pct": round(lower_pct, 1),
-        "upper_wick_pct": round(upper_pct, 1),
-    })
+_last_state = {}
 
 
 def _on_message(ws, message):
@@ -316,35 +331,27 @@ def _on_message(ws, message):
                     "price": None, "vol": None, "dir": 1, "buy_vol": 0, "sell_vol": 0,
                     "buy_vol_1m": 0, "sell_vol_1m": 0, "minute": curr_min, "chp": 0.0,
                     "bucket_5": curr_bucket_5,
-                    "c5_open": None, "c5_high": None, "c5_low": None, "c5_close": None,
-                    "unusual_vol_5m": False,
+                    "c5_open": None, "c5_high": None, "c5_low": None, "c5_close": None, "c5_vol": 0,
                     "bucket_15": curr_bucket_15,
-                    "c15_open": None, "c15_high": None, "c15_low": None, "c15_close": None,
-                    "unusual_vol_15m": False,
+                    "c15_open": None, "c15_high": None, "c15_low": None, "c15_close": None, "c15_vol": 0,
                 }
                 _last_state[symbol] = state
             
             if state["minute"] != curr_min:
-                # Minute boundary crossed -> just resets the 1-minute buy/sell
-                # volume buckets used by the "Continuously Detected" stats panel.
-                # (No candle pattern is built on this boundary anymore.)
                 state["buy_vol_1m"] = 0
                 state["sell_vol_1m"] = 0
                 state["minute"] = curr_min
 
             if state["bucket_5"] != curr_bucket_5:
-                # 5-minute boundary crossed -> the candle that was just building is
-                # now CLOSED. Finalize it, check for Hammer / Hanging Man, then
-                # start a fresh candle for the new 5m bucket.
                 if state["c5_open"] is not None:
                     closed_candle_5 = {
                         "open": state["c5_open"], "high": state["c5_high"],
                         "low": state["c5_low"], "close": state["c5_close"],
+                        "volume": state.get("c5_vol", 0),
                         "time": now.strftime("%H:%M:%S"),
                     }
-                    hist_5m = _candle_history_5m.setdefault(symbol, deque(maxlen=HAMMER_LOOKBACK + 1))
-                    _check_candle_pattern(symbol, closed_candle_5, hist_5m, _pattern_alerts_5m,
-                                           state["unusual_vol_5m"], "5m")
+                    hist_5m = _candle_history_5m.setdefault(symbol, deque(maxlen=SIGNAL_LOOKBACK + 1))
+                    _check_reversal_divergence(symbol, closed_candle_5, hist_5m, _pattern_alerts_5m, "5m")
                     hist_5m.append(closed_candle_5)
 
                 state["bucket_5"] = curr_bucket_5
@@ -352,19 +359,18 @@ def _on_message(ws, message):
                 state["c5_high"] = None
                 state["c5_low"] = None
                 state["c5_close"] = None
-                state["unusual_vol_5m"] = False
+                state["c5_vol"] = 0
 
             if state["bucket_15"] != curr_bucket_15:
-                # 15-minute boundary crossed -> finalize the 15m candle the same way.
                 if state["c15_open"] is not None:
                     closed_candle_15 = {
                         "open": state["c15_open"], "high": state["c15_high"],
                         "low": state["c15_low"], "close": state["c15_close"],
+                        "volume": state.get("c15_vol", 0),
                         "time": now.strftime("%H:%M:%S"),
                     }
-                    hist_15m = _candle_history_15m.setdefault(symbol, deque(maxlen=HAMMER_LOOKBACK + 1))
-                    _check_candle_pattern(symbol, closed_candle_15, hist_15m, _pattern_alerts_15m,
-                                           state["unusual_vol_15m"], "15m")
+                    hist_15m = _candle_history_15m.setdefault(symbol, deque(maxlen=SIGNAL_LOOKBACK + 1))
+                    _check_reversal_divergence(symbol, closed_candle_15, hist_15m, _pattern_alerts_15m, "15m")
                     hist_15m.append(closed_candle_15)
 
                 state["bucket_15"] = curr_bucket_15
@@ -372,7 +378,7 @@ def _on_message(ws, message):
                 state["c15_high"] = None
                 state["c15_low"] = None
                 state["c15_close"] = None
-                state["unusual_vol_15m"] = False
+                state["c15_vol"] = 0
             
             _last_push_ts = time.time()
             
@@ -425,6 +431,9 @@ def _on_message(ws, message):
                     if state["vol"] is not None:
                         tick_size = vol - state["vol"]
                         if tick_size > 0:
+                            state["c5_vol"] = state.get("c5_vol", 0) + tick_size
+                            state["c15_vol"] = state.get("c15_vol", 0) + tick_size
+
                             if state["dir"] == 1:
                                 state["buy_vol"] += tick_size
                                 state["buy_vol_1m"] += tick_size
@@ -433,8 +442,6 @@ def _on_message(ws, message):
                                 state["sell_vol_1m"] += tick_size
                             
                             if tick_size >= TICK_VOLUME_THRESHOLD:
-                                state["unusual_vol_5m"] = True
-                                state["unusual_vol_15m"] = True
                                 entry = {
                                     "symbol": symbol,
                                     "price": float(state["price"]) if state["price"] else 0.0,
@@ -468,7 +475,7 @@ def _on_open(ws):
             "p": [session_id, "lp", "volume", "chp", "ch"],
         }))
         ws.send(_frame({"m": "quote_add_symbols", "p": [session_id, *batch]}))
-        time.sleep(0.15)  # small stagger so TradingView doesn't see one giant burst
+        time.sleep(0.15)
 
 
 def _on_error(ws, error):
@@ -494,7 +501,7 @@ def _run_forever():
             on_close=_on_close,
         )
         ws.run_forever(ping_interval=20, ping_timeout=10)
-        time.sleep(5)  # reconnect loop
+        time.sleep(5)
 
 
 threading.Thread(target=_run_forever, daemon=True).start()
@@ -558,10 +565,10 @@ DASHBOARD_HTML = """
   .pattern-wrap { flex:1; background:var(--panel); border:1px solid var(--border); border-radius:10px; }
   .pattern-scroll { max-height:220px; overflow-y:auto; }
   .pattern-scroll table thead th { position:sticky; top:0; background:var(--panel); z-index:1; }
-  .pattern-hammer { color:var(--live); font-weight:bold; }
-  .pattern-hanging { color:var(--dead); font-weight:bold; }
-  tr.pattern-row-hammer { animation: flashGreen 1.6s ease-out; }
-  tr.pattern-row-hanging { animation: flashRed 1.6s ease-out; }
+  .pattern-buy { color:var(--live); font-weight:800; font-size:13px; }
+  .pattern-sell { color:var(--dead); font-weight:800; font-size:13px; }
+  tr.pattern-row-buy { animation: flashGreen 1.6s ease-out; }
+  tr.pattern-row-sell { animation: flashRed 1.6s ease-out; }
   @keyframes flashGreen { from { background:rgba(46,204,113,.3); } to { background:transparent; } }
   @keyframes flashRed { from { background:rgba(255,92,92,.3); } to { background:transparent; } }
   
@@ -610,20 +617,20 @@ DASHBOARD_HTML = """
 
 <div class="container" style="margin-bottom:0;">
   <div class="pattern-wrap">
-    <h2>Hammer / Hanging Man Alerts — 5m candles (latest 5, volume-confirmed)</h2>
+    <h2>Reversal &amp; Divergence Alerts — 15m candles (latest 5, BUY / SELL)</h2>
     <div class="pattern-scroll">
       <table>
-        <thead><tr><th>Time</th><th>Symbol</th><th>Pattern</th><th style="text-align:right">O</th><th style="text-align:right">H</th><th style="text-align:right">L</th><th style="text-align:right">C</th><th style="text-align:right">Body %</th><th style="text-align:right">Lower Wick %</th></tr></thead>
-        <tbody id="patternBody5"><tr><td colspan="9" class="empty">Watching for reversal candles…</td></tr></tbody>
+        <thead><tr><th>Time</th><th>Symbol</th><th>Signal</th><th>15m Pivot</th><th>RSI Divergence</th><th>Volume Divergence</th><th style="text-align:right">Price</th></tr></thead>
+        <tbody id="patternBody15"><tr><td colspan="7" class="empty">Watching for 15m signals…</td></tr></tbody>
       </table>
     </div>
   </div>
   <div class="pattern-wrap">
-    <h2>Hammer / Hanging Man Alerts — 15m candles (latest 5, volume-confirmed)</h2>
+    <h2>Reversal &amp; Divergence Alerts — 5m candles (latest 5, BUY / SELL)</h2>
     <div class="pattern-scroll">
       <table>
-        <thead><tr><th>Time</th><th>Symbol</th><th>Pattern</th><th style="text-align:right">O</th><th style="text-align:right">H</th><th style="text-align:right">L</th><th style="text-align:right">C</th><th style="text-align:right">Body %</th><th style="text-align:right">Lower Wick %</th></tr></thead>
-        <tbody id="patternBody15"><tr><td colspan="9" class="empty">Watching for reversal candles…</td></tr></tbody>
+        <thead><tr><th>Time</th><th>Symbol</th><th>Signal</th><th>5m Pivot</th><th>RSI Divergence</th><th>Volume Divergence</th><th style="text-align:right">Price</th></tr></thead>
+        <tbody id="patternBody5"><tr><td colspan="7" class="empty">Watching for 5m signals…</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -689,8 +696,6 @@ function openChart(symbol) {
   
   document.getElementById('modalTitle').innerText = symbol + " (1m Tape)";
   document.getElementById('modalChartBtn').href = `https://in.tradingview.com/chart/?symbol=NSE:${symbol}`;
-  
-  // Instantly trigger a poll to populate data without waiting 1s
   poll();
 }
 
@@ -722,34 +727,32 @@ async function poll() {
     const body = document.getElementById('feedBody');
     const hotBody = document.getElementById('hotBody');
 
-    function renderPatternTable(tbodyEl, patterns) {
-      if (!patterns || !patterns.length) {
-        tbodyEl.innerHTML = '<tr><td colspan="9" class="empty">Watching for reversal candles…</td></tr>';
+    function renderSignalTable(tbodyEl, signals, tf) {
+      if (!signals || !signals.length) {
+        tbodyEl.innerHTML = `<tr><td colspan="7" class="empty">Watching for ${tf} signals…</td></tr>`;
         return;
       }
-      tbodyEl.innerHTML = patterns.slice(0, 5).map(p => {
-        const key = 'pat_' + p.timeframe + '_' + p.symbol + p.time + p.pattern;
+      tbodyEl.innerHTML = signals.slice(0, 5).map(p => {
+        const key = 'sig_' + p.timeframe + '_' + p.symbol + p.time + p.signal;
         const isNew = !knownKeys.has(key);
         knownKeys.add(key);
-        const isHammer = p.pattern === 'HAMMER';
-        const rowClass = isNew ? (isHammer ? 'pattern-row-hammer' : 'pattern-row-hanging') : '';
-        const labelClass = isHammer ? 'pattern-hammer' : 'pattern-hanging';
+        const isBuy = p.signal === 'BUY';
+        const rowClass = isNew ? (isBuy ? 'pattern-row-buy' : 'pattern-row-sell') : '';
+        const signalClass = isBuy ? 'pattern-buy' : 'pattern-sell';
         return `<tr class="${rowClass}">
           <td class="time">${p.time}</td>
           <td class="clickable-sym" onclick="openChart('${p.symbol}')">${p.symbol}</td>
-          <td class="${labelClass}">${p.pattern}</td>
-          <td class="vol">${p.open.toFixed(2)}</td>
-          <td class="vol">${p.high.toFixed(2)}</td>
-          <td class="vol">${p.low.toFixed(2)}</td>
+          <td class="${signalClass}">${p.signal}</td>
+          <td style="font-weight:600; color:var(--text);">${p.pivot}</td>
+          <td style="color:${p.rsi_div.includes('Bullish') ? 'var(--live)' : (p.rsi_div.includes('Bearish') ? 'var(--dead)' : 'var(--muted)')};">${p.rsi_div}</td>
+          <td style="color:var(--accent);">${p.vol_div}</td>
           <td class="vol">${p.close.toFixed(2)}</td>
-          <td class="vol">${p.body_pct.toFixed(1)}%</td>
-          <td class="vol">${p.lower_wick_pct.toFixed(1)}%</td>
         </tr>`;
       }).join('');
     }
 
-    renderPatternTable(document.getElementById('patternBody5'), data.patterns_5m);
-    renderPatternTable(document.getElementById('patternBody15'), data.patterns_15m);
+    renderSignalTable(document.getElementById('patternBody15'), data.patterns_15m, '15m');
+    renderSignalTable(document.getElementById('patternBody5'), data.patterns_5m, '5m');
 
     if (!data.feed.length) {
       body.innerHTML = '<tr><td colspan="5" class="empty">Watching the tape…</td></tr>';
@@ -801,12 +804,10 @@ async function poll() {
         }).join('');
       }
       
-      // Update active modal if open
       if (activeModalSymbol) {
         let stat = data.stats[activeModalSymbol] || {buy:0, sell:0, delta:0, price:0};
         
         document.getElementById('modalTitle').innerText = activeModalSymbol + " @ ₹" + (stat.price ? stat.price.toFixed(2) : "0.00");
-        
         document.getElementById('modalBuy').innerText = fmtVol(stat.buy);
         document.getElementById('modalSell').innerText = fmtVol(stat.sell);
         
@@ -823,7 +824,7 @@ async function poll() {
 }
 
 poll();
-setInterval(poll, 1000);   // just re-reads the in-memory feed — ticks arrive independently of this
+setInterval(poll, 1000);
 </script>
 </body>
 </html>
