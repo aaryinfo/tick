@@ -245,11 +245,15 @@ def _fetch_historical_data():
 
                         hist_15m = deque(maxlen=SIGNAL_LOOKBACK + 1)
                         for ts, r in df_s.iterrows():
+                            if ts.tzinfo is None:
+                                ts_ist = ts.tz_localize("UTC").tz_convert("Asia/Kolkata")
+                            else:
+                                ts_ist = ts.tz_convert("Asia/Kolkata")
                             c_dict = {
                                 "open": float(r["open"]), "high": float(r["high"]),
                                 "low": float(r["low"]), "close": float(r["close"]),
                                 "volume": int(r["volume"]),
-                                "time": ts.strftime("%H:%M:%S")
+                                "time": ts_ist.strftime("%H:%M:%S")
                             }
                             if len(hist_15m) >= 2:
                                 _check_reversal_divergence(clean_sym, c_dict, hist_15m, _pattern_alerts_15m, "15m")
