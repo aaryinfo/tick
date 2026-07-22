@@ -36,6 +36,27 @@ HONEST CAVEATS (please read before relying on this):
 4. This is still "biggest single print" detection, not full order-flow
    / bid-ask aggressor classification like real Iris tick reads.
 
+NEW: HAMMER / HANGING MAN CANDLE ALERTS (5m AND 15m)
+- 5-minute AND 15-minute OHLC candles are built on the fly from the same
+  "lp" (last price) ticks already arriving for every symbol — no extra
+  subscription needed.
+- When a candle closes, its shape is tested: small body, long lower
+  wick (>= 2x body), little/no upper wick. This shape is IDENTICAL for
+  both patterns — only where it forms differs:
+      * forms at a new HAMMER_LOOKBACK-candle swing LOW  -> "HAMMER"       (bottom, bullish)
+      * forms at a new HAMMER_LOOKBACK-candle swing HIGH -> "HANGING MAN"  (top, bearish)
+- VOLUME CONFIRMATION: an alert only fires if that same candle also saw at
+  least one unusual print (>= TICK_VOLUME_THRESHOLD) — i.e. the stock would
+  also be showing up in "Continuously Detected". Shape without volume behind
+  it is skipped.
+- Tune the shape via HAMMER_BODY_RATIO_MAX / HAMMER_LOWER_SHADOW_MULT /
+  HAMMER_UPPER_SHADOW_MAX_RATIO, and the swing-context window via
+  HAMMER_LOOKBACK, near the top of this file.
+- Each timeframe gets its own scrollable, fixed-height panel on the
+  dashboard showing only the latest PATTERN_ALERTS_DISPLAY_LIMIT (5)
+  alerts, and in GET /api/feed under the "patterns_5m" and
+  "patterns_15m" keys.
+
 Install:
     pip install websocket-client flask --break-system-packages
 
@@ -109,12 +130,39 @@ TICK_VOLUME_THRESHOLD = 20_000     # shares in a single print to count as "unusu
 SYMBOLS_PER_SESSION = 50            # batch size per quote session (keeps subscribe messages small)
 FEED_MAX_ROWS = 150
 
+# ---------------------------------------------------------------------------
+# Hammer / Hanging Man candle-pattern alerts (5m AND 15m)
+# ---------------------------------------------------------------------------
+# Candles are built tick-by-tick (open/high/low/close of "lp") over a
+# 5-minute bucket and a 15-minute bucket. Shape test is IDENTICAL for
+# Hammer and Hanging Man (small body, long lower wick, tiny/no upper wick) —
+# the only difference is context:
+#   - forms at a new swing LOW (bottom of a move)  -> "HAMMER"      (bullish)
+#   - forms at a new swing HIGH (top of a move)     -> "HANGING MAN" (bearish)
+#
+# VOLUME CONFIRMATION: an alert only fires if the candle also saw at least one
+# "unusual" print (>= TICK_VOLUME_THRESHOLD) during that candle — i.e. the same
+# stock would also show up in "Continuously Detected". Shape without a volume
+# spike behind it is skipped.
+HAMMER_LOOKBACK = 5                 # prior closed candles used to establish swing high/low context
+HAMMER_BODY_RATIO_MAX = 0.35        # body must be <= 35% of the candle's high-low range
+HAMMER_LOWER_SHADOW_MULT = 2.0      # lower wick must be >= 2x the body
+HAMMER_UPPER_SHADOW_MAX_RATIO = 0.15  # upper wick must be <= 15% of the range
+PATTERN_FEED_MAX_ROWS = 100         # how much history each timeframe keeps server-side
+PATTERN_ALERTS_DISPLAY_LIMIT = 5    # how many latest alerts each panel actually shows
+
 WS_URL = "wss://data.tradingview.com/socket.io/websocket"
 
 _lock = threading.Lock()
 _feed = deque(maxlen=FEED_MAX_ROWS)
 _last_volume = {}          # symbol -> last known cumulative day volume
 _last_push_ts = None
+
+_candle_history_5m = {}     # symbol -> deque[{open,high,low,close,time}] of CLOSED 5m candles
+_pattern_alerts_5m = deque(maxlen=PATTERN_FEED_MAX_ROWS)   # Hammer / Hanging Man alerts (5m), newest first
+
+_candle_history_15m = {}    # symbol -> deque[{open,high,low,close,time}] of CLOSED 15m candles
+_pattern_alerts_15m = deque(maxlen=PATTERN_FEED_MAX_ROWS)  # Hammer / Hanging Man alerts (15m), newest first
 
 _historical_volume = {}
 
@@ -167,6 +215,74 @@ def _split_frames(raw: str):
 
 _last_state = {} # symbol -> {"price": None, "vol": None, "dir": 1, "buy_vol": 0, "sell_vol": 0, "buy_vol_1m": 0, "sell_vol_1m": 0, "minute": -1}
 
+
+def _hammer_shape(o: float, h: float, l: float, c: float):
+    """
+    Shape test shared by Hammer and Hanging Man (they're the same candle —
+    only the trend context differs). Returns (is_match, body_pct, lower_pct, upper_pct)
+    where the pct values are relative to the candle's high-low range, for display.
+    """
+    rng = h - l
+    if rng <= 0:
+        return False, 0.0, 0.0, 0.0
+
+    body = abs(c - o)
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+
+    is_match = (
+        lower_wick >= HAMMER_LOWER_SHADOW_MULT * max(body, rng * 0.02) and
+        upper_wick <= HAMMER_UPPER_SHADOW_MAX_RATIO * rng and
+        body <= HAMMER_BODY_RATIO_MAX * rng
+    )
+    return is_match, (body / rng) * 100, (lower_wick / rng) * 100, (upper_wick / rng) * 100
+
+
+def _check_candle_pattern(symbol: str, candle: dict, history: deque, alerts: deque,
+                           volume_confirmed: bool, timeframe: str):
+    """
+    Called once per symbol right as a candle (1m or 15m) closes. Checks the
+    just-closed candle's shape, requires it to be backed by an unusual print
+    during that same candle (volume_confirmed), then uses the preceding
+    HAMMER_LOOKBACK closed candles to decide whether it's forming at a swing
+    LOW (-> Hammer) or a swing HIGH (-> Hanging Man).
+    """
+    if not volume_confirmed:
+        return  # shape alone isn't enough — require an unusual print behind it
+
+    if len(history) < HAMMER_LOOKBACK:
+        return  # not enough prior candles yet to judge swing context
+
+    o, h, l, c = candle["open"], candle["high"], candle["low"], candle["close"]
+    is_match, body_pct, lower_pct, upper_pct = _hammer_shape(o, h, l, c)
+    if not is_match:
+        return
+
+    prior = list(history)[-HAMMER_LOOKBACK:]
+    prior_low = min(p["low"] for p in prior)
+    prior_high = max(p["high"] for p in prior)
+
+    pattern = None
+    if l <= prior_low:
+        pattern = "HAMMER"          # new swing low + shape -> bullish reversal candidate
+    elif h >= prior_high:
+        pattern = "HANGING MAN"     # new swing high + shape -> bearish reversal candidate
+
+    if pattern is None:
+        return
+
+    alerts.appendleft({
+        "symbol": symbol,
+        "pattern": pattern,
+        "timeframe": timeframe,
+        "time": candle["time"],
+        "open": round(o, 2), "high": round(h, 2), "low": round(l, 2), "close": round(c, 2),
+        "body_pct": round(body_pct, 1),
+        "lower_wick_pct": round(lower_pct, 1),
+        "upper_wick_pct": round(upper_pct, 1),
+    })
+
+
 def _on_message(ws, message):
     global _last_push_ts
     for frame in _split_frames(message):
@@ -190,16 +306,73 @@ def _on_message(ws, message):
         symbol = sym_full.split(":")[-1]
         with _lock:
             state = _last_state.get(symbol)
-            curr_min = datetime.now(IST).minute
+            now = datetime.now(IST)
+            curr_min = now.minute
+            curr_bucket_5 = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
+            curr_bucket_15 = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
             
             if state is None:
-                state = {"price": None, "vol": None, "dir": 1, "buy_vol": 0, "sell_vol": 0, "buy_vol_1m": 0, "sell_vol_1m": 0, "minute": curr_min, "chp": 0.0}
+                state = {
+                    "price": None, "vol": None, "dir": 1, "buy_vol": 0, "sell_vol": 0,
+                    "buy_vol_1m": 0, "sell_vol_1m": 0, "minute": curr_min, "chp": 0.0,
+                    "bucket_5": curr_bucket_5,
+                    "c5_open": None, "c5_high": None, "c5_low": None, "c5_close": None,
+                    "unusual_vol_5m": False,
+                    "bucket_15": curr_bucket_15,
+                    "c15_open": None, "c15_high": None, "c15_low": None, "c15_close": None,
+                    "unusual_vol_15m": False,
+                }
                 _last_state[symbol] = state
             
             if state["minute"] != curr_min:
+                # Minute boundary crossed -> just resets the 1-minute buy/sell
+                # volume buckets used by the "Continuously Detected" stats panel.
+                # (No candle pattern is built on this boundary anymore.)
                 state["buy_vol_1m"] = 0
                 state["sell_vol_1m"] = 0
                 state["minute"] = curr_min
+
+            if state["bucket_5"] != curr_bucket_5:
+                # 5-minute boundary crossed -> the candle that was just building is
+                # now CLOSED. Finalize it, check for Hammer / Hanging Man, then
+                # start a fresh candle for the new 5m bucket.
+                if state["c5_open"] is not None:
+                    closed_candle_5 = {
+                        "open": state["c5_open"], "high": state["c5_high"],
+                        "low": state["c5_low"], "close": state["c5_close"],
+                        "time": now.strftime("%H:%M:%S"),
+                    }
+                    hist_5m = _candle_history_5m.setdefault(symbol, deque(maxlen=HAMMER_LOOKBACK + 1))
+                    _check_candle_pattern(symbol, closed_candle_5, hist_5m, _pattern_alerts_5m,
+                                           state["unusual_vol_5m"], "5m")
+                    hist_5m.append(closed_candle_5)
+
+                state["bucket_5"] = curr_bucket_5
+                state["c5_open"] = None
+                state["c5_high"] = None
+                state["c5_low"] = None
+                state["c5_close"] = None
+                state["unusual_vol_5m"] = False
+
+            if state["bucket_15"] != curr_bucket_15:
+                # 15-minute boundary crossed -> finalize the 15m candle the same way.
+                if state["c15_open"] is not None:
+                    closed_candle_15 = {
+                        "open": state["c15_open"], "high": state["c15_high"],
+                        "low": state["c15_low"], "close": state["c15_close"],
+                        "time": now.strftime("%H:%M:%S"),
+                    }
+                    hist_15m = _candle_history_15m.setdefault(symbol, deque(maxlen=HAMMER_LOOKBACK + 1))
+                    _check_candle_pattern(symbol, closed_candle_15, hist_15m, _pattern_alerts_15m,
+                                           state["unusual_vol_15m"], "15m")
+                    hist_15m.append(closed_candle_15)
+
+                state["bucket_15"] = curr_bucket_15
+                state["c15_open"] = None
+                state["c15_high"] = None
+                state["c15_low"] = None
+                state["c15_close"] = None
+                state["unusual_vol_15m"] = False
             
             _last_push_ts = time.time()
             
@@ -213,6 +386,28 @@ def _on_message(ws, message):
                         elif lp < state["price"]:
                             state["dir"] = -1
                     state["price"] = lp
+
+                    if state["c5_open"] is None:
+                        state["c5_open"] = lp
+                        state["c5_high"] = lp
+                        state["c5_low"] = lp
+                    else:
+                        if lp > state["c5_high"]:
+                            state["c5_high"] = lp
+                        if lp < state["c5_low"]:
+                            state["c5_low"] = lp
+                    state["c5_close"] = lp
+
+                    if state["c15_open"] is None:
+                        state["c15_open"] = lp
+                        state["c15_high"] = lp
+                        state["c15_low"] = lp
+                    else:
+                        if lp > state["c15_high"]:
+                            state["c15_high"] = lp
+                        if lp < state["c15_low"]:
+                            state["c15_low"] = lp
+                    state["c15_close"] = lp
                 except ValueError:
                     pass
 
@@ -238,6 +433,8 @@ def _on_message(ws, message):
                                 state["sell_vol_1m"] += tick_size
                             
                             if tick_size >= TICK_VOLUME_THRESHOLD:
+                                state["unusual_vol_5m"] = True
+                                state["unusual_vol_15m"] = True
                                 entry = {
                                     "symbol": symbol,
                                     "price": float(state["price"]) if state["price"] else 0.0,
@@ -321,12 +518,16 @@ def api_feed():
                     "vol_5d": _historical_volume.get(sym, 0),
                     "vol_today": int(st.get("vol") or 0)
                 }
+        patterns_5m_snapshot = list(_pattern_alerts_5m)[:PATTERN_ALERTS_DISPLAY_LIMIT]
+        patterns_15m_snapshot = list(_pattern_alerts_15m)[:PATTERN_ALERTS_DISPLAY_LIMIT]
     return jsonify({
         "ok": True,
         "connected": live,
         "timestamp": datetime.fromtimestamp(ts, IST).strftime("%H:%M:%S") if ts else "",
         "feed": feed_snapshot,
-        "stats": stats
+        "stats": stats,
+        "patterns_5m": patterns_5m_snapshot,
+        "patterns_15m": patterns_15m_snapshot
     })
 
 
@@ -354,6 +555,15 @@ DASHBOARD_HTML = """
   .container { display:flex; gap:12px; max-width:1800px; margin:16px auto; align-items:flex-start; padding:0 12px; }
   .feed-wrap { flex:1; background:var(--panel); border:1px solid var(--border); border-radius:10px; overflow-x:auto; }
   .hot-wrap { flex:1.8; background:var(--panel); border:1px solid var(--border); border-radius:10px; overflow-x:auto; }
+  .pattern-wrap { flex:1; background:var(--panel); border:1px solid var(--border); border-radius:10px; }
+  .pattern-scroll { max-height:220px; overflow-y:auto; }
+  .pattern-scroll table thead th { position:sticky; top:0; background:var(--panel); z-index:1; }
+  .pattern-hammer { color:var(--live); font-weight:bold; }
+  .pattern-hanging { color:var(--dead); font-weight:bold; }
+  tr.pattern-row-hammer { animation: flashGreen 1.6s ease-out; }
+  tr.pattern-row-hanging { animation: flashRed 1.6s ease-out; }
+  @keyframes flashGreen { from { background:rgba(46,204,113,.3); } to { background:transparent; } }
+  @keyframes flashRed { from { background:rgba(255,92,92,.3); } to { background:transparent; } }
   
   h2 { font-size:14px; margin:0; padding:12px 16px; border-bottom:1px solid var(--border); background:rgba(255,255,255,0.03); }
   table { width:100%; border-collapse:collapse; font-size:13px; }
@@ -397,6 +607,27 @@ DASHBOARD_HTML = """
   <h1>Tick Query Feed — Live WebSocket (Nifty 500)</h1>
   <span class="status" id="statusText"><span class="dot" id="statusDot" style="background:var(--muted)"></span>connecting…</span>
 </header>
+
+<div class="container" style="margin-bottom:0;">
+  <div class="pattern-wrap">
+    <h2>Hammer / Hanging Man Alerts — 5m candles (latest 5, volume-confirmed)</h2>
+    <div class="pattern-scroll">
+      <table>
+        <thead><tr><th>Time</th><th>Symbol</th><th>Pattern</th><th style="text-align:right">O</th><th style="text-align:right">H</th><th style="text-align:right">L</th><th style="text-align:right">C</th><th style="text-align:right">Body %</th><th style="text-align:right">Lower Wick %</th></tr></thead>
+        <tbody id="patternBody5"><tr><td colspan="9" class="empty">Watching for reversal candles…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="pattern-wrap">
+    <h2>Hammer / Hanging Man Alerts — 15m candles (latest 5, volume-confirmed)</h2>
+    <div class="pattern-scroll">
+      <table>
+        <thead><tr><th>Time</th><th>Symbol</th><th>Pattern</th><th style="text-align:right">O</th><th style="text-align:right">H</th><th style="text-align:right">L</th><th style="text-align:right">C</th><th style="text-align:right">Body %</th><th style="text-align:right">Lower Wick %</th></tr></thead>
+        <tbody id="patternBody15"><tr><td colspan="9" class="empty">Watching for reversal candles…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
 
 <div class="container">
   <div class="feed-wrap">
@@ -490,7 +721,36 @@ async function poll() {
 
     const body = document.getElementById('feedBody');
     const hotBody = document.getElementById('hotBody');
-    
+
+    function renderPatternTable(tbodyEl, patterns) {
+      if (!patterns || !patterns.length) {
+        tbodyEl.innerHTML = '<tr><td colspan="9" class="empty">Watching for reversal candles…</td></tr>';
+        return;
+      }
+      tbodyEl.innerHTML = patterns.slice(0, 5).map(p => {
+        const key = 'pat_' + p.timeframe + '_' + p.symbol + p.time + p.pattern;
+        const isNew = !knownKeys.has(key);
+        knownKeys.add(key);
+        const isHammer = p.pattern === 'HAMMER';
+        const rowClass = isNew ? (isHammer ? 'pattern-row-hammer' : 'pattern-row-hanging') : '';
+        const labelClass = isHammer ? 'pattern-hammer' : 'pattern-hanging';
+        return `<tr class="${rowClass}">
+          <td class="time">${p.time}</td>
+          <td class="clickable-sym" onclick="openChart('${p.symbol}')">${p.symbol}</td>
+          <td class="${labelClass}">${p.pattern}</td>
+          <td class="vol">${p.open.toFixed(2)}</td>
+          <td class="vol">${p.high.toFixed(2)}</td>
+          <td class="vol">${p.low.toFixed(2)}</td>
+          <td class="vol">${p.close.toFixed(2)}</td>
+          <td class="vol">${p.body_pct.toFixed(1)}%</td>
+          <td class="vol">${p.lower_wick_pct.toFixed(1)}%</td>
+        </tr>`;
+      }).join('');
+    }
+
+    renderPatternTable(document.getElementById('patternBody5'), data.patterns_5m);
+    renderPatternTable(document.getElementById('patternBody15'), data.patterns_15m);
+
     if (!data.feed.length) {
       body.innerHTML = '<tr><td colspan="5" class="empty">Watching the tape…</td></tr>';
       hotBody.innerHTML = '<tr><td colspan="6" class="empty">None yet</td></tr>';
